@@ -13,20 +13,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{secrets.AWS_ACCESS_KEY_ID}}
           aws-secret-access-key: ${{secrets.AWS_SECRET_ACCESS_KEY}}
           aws-region: us-east-1
 
       - name: Install Packer
-        uses: hashicorp/setup-packer@v2
+        uses: hashicorp/setup-packer@v2.0.0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v3
         with:
           java-version: "21"
           distribution: "adopt"
@@ -54,7 +54,6 @@ jobs:
             -var="subnet_id=${{secrets.SUBNET_ID}}" \
             -var='ami_users=["${{secrets.AMI_USERS}}"]' \
             .
-          # Store AMI ID for both environments
           AMI_ID=$(aws ec2 describe-images --filters "Name=name,Values=csye6225_*" --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
           echo "AMI_ID=${AMI_ID}" >> $GITHUB_ENV
 
@@ -62,8 +61,7 @@ jobs:
         if: success()
         run: echo "Packer build completed successfully"
 
-      # Update Dev Environment
-      - name: Update Dev Launch Template and Start Instance Refresh
+      - name: Update Dev Environment
         run: |
           LAUNCH_TEMPLATE_ID=$(aws ec2 describe-launch-templates \
             --filters "Name=tag:Environment,Values=dev" \
@@ -114,15 +112,14 @@ jobs:
             sleep 30
           done
 
-      # Switch to Demo Account and Update Demo Environment
       - name: Configure AWS Demo Account credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{secrets.DEMO_AWS_ACCESS_KEY_ID}}
           aws-secret-access-key: ${{secrets.DEMO_AWS_SECRET_ACCESS_KEY}}
           aws-region: us-east-1
 
-      - name: Update Demo Launch Template and Start Instance Refresh
+      - name: Update Demo Environment
         run: |
           LAUNCH_TEMPLATE_ID=$(aws ec2 describe-launch-templates \
             --filters "Name=tag:Environment,Values=demo" \
