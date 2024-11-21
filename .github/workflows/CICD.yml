@@ -7,37 +7,34 @@ on:
     branches:
       - main
 
-permissions:
-  contents: read
-
 jobs:
   build-and-deploy:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      - name: Configure AWS Dev Account credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
-          aws-access-key-id: ${{ secrets.DEV_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.DEV_AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{secrets.AWS_ACCESS_KEY_ID}}
+          aws-secret-access-key: ${{secrets.AWS_SECRET_ACCESS_KEY}}
           aws-region: us-east-1
 
       - name: Install Packer
-        uses: hashicorp/setup-packer@v2.0.0
+        uses: hashicorp/setup-packer@v2
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v2
         with:
           java-version: "21"
-          distribution: "temurin"
+          distribution: "adopt"
 
       - name: Build with Maven
         env:
-          DB_USERNAME: ${{ secrets.DB_USERNAME }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_USERNAME: ${{secrets.DB_USERNAME}}
+          DB_PASSWORD: ${{secrets.DB_PASSWORD}}
         run: mvn clean install -DskipTests
 
       - name: Run tests
@@ -49,27 +46,30 @@ jobs:
           PACKER_LOG: 1
         run: |
           packer init .
-          packer validate -var="aws_region=${{ secrets.AWS_REGION }}" \
-            -var="subnet_id=${{ secrets.SUBNET_ID }}" \
-            -var='ami_users=["${{ secrets.DEMO_ACCOUNT_ID }}"]' \
+          packer validate -var="aws_region=${{secrets.AWS_REGION}}" \
+            -var="subnet_id=${{secrets.SUBNET_ID}}" \
+            -var='ami_users=["${{secrets.AMI_USERS}}"]' \
             .
-          packer build -var="aws_region=${{ secrets.AWS_REGION }}" \
-            -var="subnet_id=${{ secrets.SUBNET_ID }}" \
-            -var='ami_users=["${{ secrets.DEMO_ACCOUNT_ID }}"]' \
+          packer build -var="aws_region=${{secrets.AWS_REGION}}" \
+            -var="subnet_id=${{secrets.SUBNET_ID}}" \
+            -var='ami_users=["${{secrets.AMI_USERS}}"]' \
             .
+          # Store AMI ID for both environments
           AMI_ID=$(aws ec2 describe-images --filters "Name=name,Values=csye6225_*" --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
           echo "AMI_ID=${AMI_ID}" >> $GITHUB_ENV
 
-      - name: Configure AWS Demo Account credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.DEMO_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.DEMO_AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+      - name: Verify Build Status
+        if: success()
+        run: echo "Packer build completed successfully"
 
-      - name: Update Launch Template and Start Instance Refresh
+      # Update Dev Environment
+      - name: Update Dev Launch Template and Start Instance Refresh
         run: |
-          LAUNCH_TEMPLATE_ID="${{ secrets.LAUNCH_TEMPLATE_ID }}"
+          LAUNCH_TEMPLATE_ID=$(aws ec2 describe-launch-templates \
+            --filters "Name=tag:Environment,Values=dev" \
+            --query 'LaunchTemplates[0].LaunchTemplateId' \
+            --output text)
+          
           CURRENT_VERSION=$(aws ec2 describe-launch-templates \
             --launch-template-id $LAUNCH_TEMPLATE_ID \
             --query 'LaunchTemplates[0].LatestVersionNumber' \
@@ -78,36 +78,97 @@ jobs:
           NEW_VERSION=$(aws ec2 create-launch-template-version \
             --launch-template-id $LAUNCH_TEMPLATE_ID \
             --source-version $CURRENT_VERSION \
-            --launch-template-data "{\"ImageId\":\"${{ env.AMI_ID }}\"}" \
+            --launch-template-data "{\"ImageId\":\"${{env.AMI_ID}}\"}" \
             --query 'LaunchTemplateVersion.VersionNumber' \
             --output text)
           
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --filters "Name=tag:Environment,Values=dev" \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text)
+          
           aws autoscaling update-auto-scaling-group \
-            --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
+            --auto-scaling-group-name $ASG_NAME \
             --launch-template LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$NEW_VERSION
           
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
+            --auto-scaling-group-name $ASG_NAME \
             --preferences '{"MinHealthyPercentage": 90, "InstanceWarmup": 300}' \
             --query 'InstanceRefreshId' \
             --output text)
           
+          echo "Monitoring Dev instance refresh: $REFRESH_ID"
           while true; do
             STATUS=$(aws autoscaling describe-instance-refreshes \
-              --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
+              --auto-scaling-group-name $ASG_NAME \
               --instance-refresh-ids $REFRESH_ID \
               --query 'InstanceRefreshes[0].Status' \
               --output text)
             
-            echo "Instance refresh status: $STATUS"
-            
+            echo "Dev instance refresh status: $STATUS"
             if [ "$STATUS" = "Successful" ]; then
-              echo "Instance refresh completed successfully"
-              exit 0
+              break
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "Instance refresh failed or was cancelled"
               exit 1
             fi
+            sleep 30
+          done
+
+      # Switch to Demo Account and Update Demo Environment
+      - name: Configure AWS Demo Account credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{secrets.DEMO_AWS_ACCESS_KEY_ID}}
+          aws-secret-access-key: ${{secrets.DEMO_AWS_SECRET_ACCESS_KEY}}
+          aws-region: us-east-1
+
+      - name: Update Demo Launch Template and Start Instance Refresh
+        run: |
+          LAUNCH_TEMPLATE_ID=$(aws ec2 describe-launch-templates \
+            --filters "Name=tag:Environment,Values=demo" \
+            --query 'LaunchTemplates[0].LaunchTemplateId' \
+            --output text)
+          
+          CURRENT_VERSION=$(aws ec2 describe-launch-templates \
+            --launch-template-id $LAUNCH_TEMPLATE_ID \
+            --query 'LaunchTemplates[0].LatestVersionNumber' \
+            --output text)
+          
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-id $LAUNCH_TEMPLATE_ID \
+            --source-version $CURRENT_VERSION \
+            --launch-template-data "{\"ImageId\":\"${{env.AMI_ID}}\"}" \
+            --query 'LaunchTemplateVersion.VersionNumber' \
+            --output text)
+          
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --filters "Name=tag:Environment,Values=demo" \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text)
+          
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name $ASG_NAME \
+            --launch-template LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$NEW_VERSION
+          
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name $ASG_NAME \
+            --preferences '{"MinHealthyPercentage": 90, "InstanceWarmup": 300}' \
+            --query 'InstanceRefreshId' \
+            --output text)
+          
+          echo "Monitoring Demo instance refresh: $REFRESH_ID"
+          while true; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name $ASG_NAME \
+              --instance-refresh-ids $REFRESH_ID \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
             
+            echo "Demo instance refresh status: $STATUS"
+            if [ "$STATUS" = "Successful" ]; then
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              exit 1
+            fi
             sleep 30
           done
